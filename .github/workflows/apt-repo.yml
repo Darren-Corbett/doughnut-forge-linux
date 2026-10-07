@@ -1,0 +1,83 @@
+name: Update apt repository
+
+on:
+  repository_dispatch:
+    types: [linux-release]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: apt-repo
+  cancel-in-progress: false
+
+env:
+  KEEP_RELEASES: 3   # newest stable releases kept in the repo; the Pages site must stay under 1 GB
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: install apt tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils
+
+      - name: collect the .deb files from the newest stable releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p site/pool/main
+          tags="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-pre-releases --exclude-drafts --limit "$KEEP_RELEASES" --json tagName --jq '.[].tagName')"
+          [ -n "$tags" ] || { echo "::error::No stable releases found"; exit 1; }
+          for tag in $tags; do
+            echo "Downloading .deb files from $tag"
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern '*.deb' --dir site/pool/main
+          done
+          ls -la site/pool/main
+
+      - name: build the apt repository (unsigned)
+        run: |
+          set -euo pipefail
+          cd site
+          for arch in amd64 arm64; do
+            dir="dists/stable/main/binary-$arch"
+            mkdir -p "$dir"
+            apt-ftparchive --arch "$arch" packages pool > "$dir/Packages"
+            gzip -9 -k -f "$dir/Packages"
+          done
+
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin="Doughnut Forge" \
+            -o APT::FTPArchive::Release::Label="Doughnut Forge" \
+            -o APT::FTPArchive::Release::Suite="stable" \
+            -o APT::FTPArchive::Release::Codename="stable" \
+            -o APT::FTPArchive::Release::Architectures="amd64 arm64" \
+            -o APT::FTPArchive::Release::Components="main" \
+            release dists/stable > dists/stable/Release
+
+          cat > index.html <<'EOF'
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>Doughnut Forge apt repository</title>
+          <h1>Doughnut Forge for Debian / Ubuntu</h1>
+          <pre>
+          echo "deb [trusted=yes arch=amd64,arm64] https://darren-corbett.github.io/doughnut-forge-linux stable main" | sudo tee /etc/apt/sources.list.d/doughnut-forge.list
+          sudo apt update
+          sudo apt install doughnut-forge
+          </pre>
+          EOF
+
+          find . -type f | sort
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - id: deployment
+        uses: actions/deploy-pages@v5
